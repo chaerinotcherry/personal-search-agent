@@ -10,6 +10,7 @@ from embeddings import init_model
 from gaps import router as gaps_router
 from ingest import router as ingest_router
 from search import router as search_router
+from timeline import generate_timeline
 from user_profile import router as user_profile_router
 
 
@@ -38,3 +39,9 @@ app.include_router(user_profile_router)
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/api/timeline")
+async def timeline(start_date: str, end_date: str):
+    result = await generate_timeline(start_date, end_date)
+    return result
