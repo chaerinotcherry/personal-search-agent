@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 
 from analytics import router as analytics_router
+from auth.router import router as auth_router
 from chat import router as chat_router
 from config import settings
 from db import init_collection
@@ -36,6 +37,7 @@ app.include_router(gaps_router)
 app.include_router(user_profile_router)
 app.include_router(portfolio_router)
 app.include_router(timeline_router)
+app.include_router(auth_router)
 
 
 @app.get("/health")
