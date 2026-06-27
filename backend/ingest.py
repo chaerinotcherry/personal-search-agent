@@ -6,7 +6,7 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from pydantic import BaseModel
 
@@ -20,9 +20,9 @@ SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md"}
 
 
 def _parse_pdf(data: bytes) -> str:
-    import pypdf
-    reader = pypdf.PdfReader(io.BytesIO(data))
-    return "\n".join(page.extract_text() or "" for page in reader.pages)
+    import fitz  # pymupdf
+    doc = fitz.open(stream=data, filetype="pdf")
+    return "\n".join(page.get_text() for page in doc)
 
 
 def _parse_docx(data: bytes) -> str:
@@ -118,6 +118,11 @@ class ExternalIngestResponse(BaseModel):
     pages_skipped: int
     chunks_ingested: int
     collection: str
+
+
+class IngestJobResponse(BaseModel):
+    status: str
+    message: str
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -246,28 +251,21 @@ async def ingest_notion():
     )
 
 
-@router.post("/ingest/gdrive", response_model=ExternalIngestResponse)
-async def ingest_gdrive(folder_id: str | None = None):
+async def _run_gdrive_ingest(folder_id: str | None) -> None:
+    """백그라운드에서 실행되는 실제 GDrive ingest 로직"""
     from ingest_gdrive import download_file, get_drive_service, get_extension, list_files
-
     try:
         service = await asyncio.to_thread(
             get_drive_service, settings.gdrive_credentials_path, settings.gdrive_token_path
         )
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=503, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Google Drive 인증 오류: {e}")
-
-    try:
         files = await asyncio.to_thread(list_files, service, folder_id)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Google Drive 파일 목록 오류: {e}")
+        print(f"[gdrive] setup error: {e}")
+        return
 
-    MAX_FILE_BYTES = 10 * 1024 * 1024  # 10MB
+    MAX_FILE_BYTES = 10 * 1024 * 1024
+    FILE_TIMEOUT = 60
     processed, skipped, total_chunks = 0, 0, 0
-    import logging
-    logger = logging.getLogger(__name__)
 
     for f in files:
         ext = get_extension(f["mimeType"])
@@ -276,15 +274,25 @@ async def ingest_gdrive(folder_id: str | None = None):
             continue
         size = int(f.get("size", 0) or 0)
         if size > MAX_FILE_BYTES:
-            logger.info(f"[gdrive] skip (too large {size//1024//1024}MB): {f['name']}")
+            print(f"[gdrive] skip too large ({size//1024//1024}MB): {f['name']}")
             skipped += 1
             continue
-        logger.info(f"[gdrive] processing: {f['name']}")
+        print(f"[gdrive] processing: {f['name']}")
         try:
-            data = await asyncio.to_thread(download_file, service, f["id"], f["mimeType"])
-            text = extract_text(data, ext).strip()
+            data = await asyncio.wait_for(
+                asyncio.to_thread(download_file, service, f["id"], f["mimeType"]),
+                timeout=FILE_TIMEOUT,
+            )
+            text = await asyncio.wait_for(
+                asyncio.to_thread(lambda d=data, e=ext: extract_text(d, e).strip()),
+                timeout=FILE_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            print(f"[gdrive] timeout parsing: {f['name']}")
+            skipped += 1
+            continue
         except Exception as e:
-            logger.warning(f"[gdrive] failed to parse {f['name']}: {e}")
+            print(f"[gdrive] parse error {f['name']}: {e}")
             skipped += 1
             continue
         if not text:
@@ -299,19 +307,38 @@ async def ingest_gdrive(folder_id: str | None = None):
             "created_at": int(modified) if modified else 0,
         }
         try:
-            n = ingest_document(text, doc_id_key=f["id"], metadata=metadata)
+            n = await asyncio.wait_for(
+                asyncio.to_thread(ingest_document, text, f["id"], metadata),
+                timeout=FILE_TIMEOUT,
+            )
             total_chunks += n
             processed += 1
-            logger.info(f"[gdrive] done: {f['name']} ({n} chunks)")
+            print(f"[gdrive] done: {f['name']} ({n} chunks)")
+        except asyncio.TimeoutError:
+            print(f"[gdrive] timeout embedding: {f['name']}")
+            skipped += 1
         except Exception as e:
-            logger.warning(f"[gdrive] ingest failed {f['name']}: {e}")
+            print(f"[gdrive] ingest error {f['name']}: {e}")
             skipped += 1
 
-    return ExternalIngestResponse(
-        status="ok",
-        source="gdrive",
-        pages_processed=processed,
-        pages_skipped=skipped,
-        chunks_ingested=total_chunks,
-        collection=settings.collection_name,
+    print(f"[gdrive] 완료 — {processed}개 파일, {total_chunks}개 청크, {skipped}개 스킵")
+
+
+@router.post("/ingest/gdrive", response_model=IngestJobResponse)
+async def ingest_gdrive(background_tasks: BackgroundTasks, folder_id: str | None = None):
+    from ingest_gdrive import get_drive_service
+
+    try:
+        await asyncio.to_thread(
+            get_drive_service, settings.gdrive_credentials_path, settings.gdrive_token_path
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Google Drive 인증 오류: {e}")
+
+    background_tasks.add_task(_run_gdrive_ingest, folder_id)
+    return IngestJobResponse(
+        status="started",
+        message="GDrive ingest 백그라운드 시작됨. docker logs로 진행 확인 가능.",
     )

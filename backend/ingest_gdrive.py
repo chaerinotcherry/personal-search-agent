@@ -46,15 +46,18 @@ def list_files(service, folder_id: str | None = None) -> list[dict]:
         query_parts.append(f"'{folder_id}' in parents")
     query = " and ".join(query_parts)
 
-    files, token = [], None
+    seen, files, token = set(), [], None
     while True:
         resp = service.files().list(
             q=query,
-            fields="nextPageToken, files(id, name, mimeType, modifiedTime)",
+            fields="nextPageToken, files(id, name, mimeType, modifiedTime, size)",
             pageToken=token,
             pageSize=100,
         ).execute()
-        files.extend(resp.get("files", []))
+        for f in resp.get("files", []):
+            if f["id"] not in seen:
+                seen.add(f["id"])
+                files.append(f)
         token = resp.get("nextPageToken")
         if not token:
             break
